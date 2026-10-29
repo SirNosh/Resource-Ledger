@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: cargo test
+      # The real readings of this OS (CPU, RAM, and any GPU the runner has)
+      - run: cargo test real_probe -- --ignored --nocapture

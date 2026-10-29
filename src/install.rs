@@ -39,8 +39,12 @@ pub fn run(client: &str) -> Result<String, String> {
         "codex" => {
             let path = home.join(".codex").join("hooks.json");
             let hook = |event: &str, timeout: u32| {
-                let cmd = format!("\"{exe}\" hook codex {event}"); // Codex runs hooks through cmd.exe
-                json!({"type": "command", "command": cmd, "commandWindows": cmd, "timeout": timeout})
+                let cmd = format!("\"{exe}\" hook codex {event}");
+                let mut h = json!({"type": "command", "command": cmd, "timeout": timeout});
+                if cfg!(windows) {
+                    h["commandWindows"] = json!(cmd); // Codex runs hooks through cmd.exe there
+                }
+                h
             };
             set_hooks(&path, vec![
                 ("SessionStart", None, hook("start", 15)),
@@ -60,8 +64,9 @@ pub fn run(client: &str) -> Result<String, String> {
     }
 }
 
+/// `.../resource-ledger[.exe]["] hook ...`, as written on any OS.
 fn is_ours(cmd: &str) -> bool {
-    cmd.contains("resource-ledger.exe\" hook ") || cmd.contains("resource-ledger.exe hook ")
+    cmd.replace(".exe", "").replace('"', "").contains("resource-ledger hook ")
 }
 
 /// Remove every resource-ledger hook (and any group or event only resource-ledger used), then append `wanted`.

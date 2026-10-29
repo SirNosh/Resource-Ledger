@@ -11,7 +11,7 @@ mod probe;
 use std::collections::HashMap;
 
 const USAGE: &str = "usage:
-  resource-ledger request --minutes M --purpose TEXT [--vram GB] [--ram GB] [--cpus N] [--session KEY]
+  resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--session KEY]
   resource-ledger release ID
   resource-ledger extend ID MINUTES
   resource-ledger status
@@ -19,7 +19,8 @@ const USAGE: &str = "usage:
 Run `resource-ledger help` for the full guide.";
 
 /// Written for the agents that use the tool: when to use it, the protocol, and every command.
-const HELP: &str = r#"resource-ledger: a shared reservation ledger for GPU memory, RAM and CPUs on this machine.
+/// Agents also get it when a session starts (see hooks.rs).
+const HELP: &str = r#"resource-ledger: a shared reservation ledger for the GPUs, RAM and CPUs of this machine.
 Every coding-agent session (Claude Code, Codex, OpenCode, or any agent with a shell) checks in
 with it before heavy work, so jobs from different sessions do not collide. It is advisory:
 nothing is reserved, enforced or killed, and every agent is trusted to keep it accurate.
@@ -31,7 +32,7 @@ WHEN TO USE IT
 
 PROTOCOL: one ticket = one task
   1. Ask:     resource-ledger request --vram 8 --ram 16 --cpus 4 --minutes 90 --purpose "LoRA finetune"
-  2. GRANTED: start the task.
+  2. GRANTED: start the task, on the GPU(s) the grant names and no others.
      QUEUED:  do not start it. With hooks (Claude Code, Codex, OpenCode), end your turn: you are
               woken when it is granted. Without hooks, check `resource-ledger status` now and then.
   3. Done:    resource-ledger release ID   as soon as the task finishes, even if time is left.
@@ -39,23 +40,40 @@ PROTOCOL: one ticket = one task
      Use `extend` only when the same task runs past its minutes.
 
 COMMANDS
-  request --minutes M --purpose TEXT [--vram GB] [--ram GB] [--cpus N] [--session KEY]
+  request --minutes M --purpose TEXT [--vram GB] [--gpus N] [--gpu WHICH] [--ram GB] [--cpus N] [--session KEY]
       Ask for resources for one task. Give at least one of --vram/--ram/--cpus; omitted ones
-      are 0, and GB may be fractional. Prints one ticket line; the ticket ID follows '#':
-        #7 [granted] 8 GB VRAM, 16 GB RAM, 4 CPUs for 90 min: LoRA finetune. GRANTED: 1 h 30 min left. ...
+      are 0, and GB may be fractional. Estimate honestly: everyone else is scheduled around it.
+        --vram GB    VRAM on each GPU the task uses.
+        --gpus N     How many GPUs it uses, each with --vram GB (default 1).
+        --gpu WHICH  The GPUs it may use: a vendor (nvidia, amd, intel, apple) or GPU numbers as
+                     `status` lists them (0, or 0,2). Required if the GPUs are from several vendors.
+      Prints one ticket line; the ticket ID follows '#':
+        #7 [granted] 8 GB VRAM, 16 GB RAM, 4 CPUs for 90 min: LoRA finetune on GPU 0 (NVIDIA GeForce
+           RTX 4090; CUDA_VISIBLE_DEVICES=GPU-...). GRANTED: 1 h 30 min left. ...
         #8 [queued] 16 CPUs for 30 min: test suite. QUEUED: position 1, estimated start in 25 min. ...
   release ID          The task is done: free the grant, or cancel a queued request.
   extend ID MINUTES   The same task needs longer. Requests behind it may start later.
-  status              Capacity, held totals, live free memory, every open ticket and its session.
+  status              Each GPU, RAM and CPUs (held, and in use outside the ledger), and every open
+                      ticket with its session.
   help                This guide. -h and --help work anywhere.
   install claude|codex|opencode
                       One-time setup by a person: adds the hooks or plugin to that client.
   hook CLIENT EVENT   Run by those hooks; not for direct use.
 
+GPUS
+  Every GPU the ledger can see is in the pool and scheduled on its own: NVIDIA, AMD and Intel
+  graphics cards, and Apple Silicon. Other integrated GPUs are left out, as their memory is RAM.
+  Apple Silicon's GPU shares RAM too, so there --vram counts against RAM.
+  A grant names its GPUs. Where it gives a variable (CUDA_VISIBLE_DEVICES=..., ROCR_VISIBLE_DEVICES=...),
+  set it for the task's processes so they use only those GPUs; otherwise pick them by the name given.
+
 SCHEDULING
   First come, first served, with backfill: a later request starts earlier only if it fits on
-  every resource for its whole duration without delaying anyone ahead of it. A grant also needs
-  its VRAM and RAM to be free on the machine right now, so memory used outside the ledger counts.
+  every resource for its whole duration without delaying anyone ahead of it. A GPU request gets
+  the eligible GPUs with the most room, so jobs spread out rather than share a card.
+  Use outside the ledger counts: VRAM per GPU, RAM and busy CPUs are measured, and whatever is
+  in use beyond the grants (the person at the machine, programs not in the ledger) is not handed
+  out. For a grant's first 3 min its use is counted on top of the readings, which may not show it yet.
   Estimated starts assume holders use all their time; they move up when holders release early.
   When a grant's minutes run out it gets an "out of time" notice; 15 min later it is
   force-expired and its resources go to the next in line.
@@ -69,9 +87,10 @@ EXIT CODES
   0  success: read the output for GRANTED or QUEUED
   2  error: the reason is on stderr
 
-State: %LOCALAPPDATA%\resource-ledger\ledger.json (RESOURCE_LEDGER_HOME overrides)."#;
+State: ledger.json in a resource-ledger folder under %LOCALAPPDATA% (Windows), ~/Library/Application
+Support (macOS), or $XDG_STATE_HOME, else ~/.local/state (Linux). RESOURCE_LEDGER_HOME overrides it."#;
 
-const FLAGS: [&str; 6] = ["vram", "ram", "cpus", "minutes", "purpose", "session"];
+const FLAGS: [&str; 8] = ["vram", "gpus", "gpu", "ram", "cpus", "minutes", "purpose", "session"];
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -124,11 +143,12 @@ fn command(pos: &[&str], flags: &HashMap<&str, &str>) -> Result<String, String> 
     match pos {
         ["request"] => {
             let get = |k: &str| flags.get(k).map_or(Ok(0.0), |v| num(v, &format!("--{k}")));
-            let need = [get("vram")?, get("ram")?, get("cpus")?];
+            let gpus = flags.get("gpus").map_or(Ok(0), |v| v.parse().map_err(|_| format!("--gpus must be a whole number, got `{v}`")))?;
+            let need = ledger::Need { vram: get("vram")?, gpus, ram: get("ram")?, cpus: get("cpus")?, ..Default::default() };
             let minutes = num(flags.get("minutes").ok_or("--minutes is required")?, "--minutes")?;
             let purpose = flags.get("purpose").ok_or("--purpose is required")?;
             let session = session(flags.get("session").copied())?;
-            ledger::with(|st| st.request(ledger::now(), &session, need, minutes, purpose))
+            ledger::with(|st| st.request(ledger::now(), &session, need, flags.get("gpu").copied(), minutes, purpose))
         }
         ["release", t] => {
             let t = id(t)?;

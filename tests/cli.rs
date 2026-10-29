@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const MACHINE: &str = r#"{"vram_total":12,"vram_free":12,"ram_total":32,"ram_free":32,"cpus":16}"#;
+const MACHINE: &str = r#"{"gpus":[{"id":"g0","vendor":"nvidia","name":"Test GPU","total":12,"used":0,"select":"CUDA_VISIBLE_DEVICES=GPU-test"}],
+    "ram_total":32,"ram_used":0,"cpus":16,"cpus_busy":0}"#;
 
 fn home(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("resource-ledger-test-{}-{name}", std::process::id()));
@@ -89,10 +90,12 @@ fn request_queue_release_and_notice_once() {
 #[test]
 fn bad_input_is_refused() {
     let h = home("bad");
-    let (code, _, err) = run(&h, &["request", "--gpu", "8", "--minutes", "5", "--purpose", "x"], "");
-    assert!(code == 2 && err.contains("--gpu"), "{err}");
+    let (code, _, err) = run(&h, &["request", "--vgpu", "8", "--minutes", "5", "--purpose", "x"], "");
+    assert!(code == 2 && err.contains("unknown option --vgpu"), "{err}");
     let (code, _, err) = run(&h, &["request", "--vram", "13", "--minutes", "5", "--purpose", "x", "--session", "s"], "");
-    assert!(code == 2 && err.contains("capacity"), "{err}");
+    assert!(code == 2 && err.contains("only 0 of the GPUs") && err.contains("GPU 0: Test GPU"), "{err}");
+    let (code, _, err) = run(&h, &["request", "--vram", "4", "--gpus", "two", "--minutes", "5", "--purpose", "x"], "");
+    assert!(code == 2 && err.contains("--gpus must be a whole number"), "{err}");
     let o = cmd(&h, &["request", "--cpus", "1", "--minutes", "5", "--purpose", "x"]).env("CLAUDECODE", "1").output().unwrap();
     assert!(o.status.code() == Some(2) && String::from_utf8_lossy(&o.stderr).contains("no session key"));
     assert_eq!(run(&h, &["release", "7"], "").0, 2);
@@ -110,12 +113,18 @@ fn help_is_available_however_an_agent_asks() {
 }
 
 #[test]
-fn intro_on_session_start() {
+fn intro_on_session_start_has_guide_machine_and_key() {
     let h = home("intro");
-    let c = context(&run(&h, &["hook", "claude", "start"], &sid("s1")).1);
-    assert!(c.contains("shared resource ledger") && c.contains("claude:s1 (applied automatically)"), "{c}");
-    let x = context(&run(&h, &["hook", "codex", "start"], &sid("c9")).1);
-    assert!(x.contains("--session codex:c9"), "{x}");
+    let guide = ok(&h, &["help"]);
+    let claude = context(&run(&h, &["hook", "claude", "start"], &sid("s1")).1);
+    let codex = context(&run(&h, &["hook", "codex", "start"], &sid("c9")).1);
+    let opencode = ok(&h, &["hook", "opencode", "intro", "--session", "opencode:o1"]);
+    for (text, key) in [(&claude, "claude:s1 (applied"), (&codex, "--session codex:c9`"), (&opencode, "opencode:o1 (applied")] {
+        assert!(text.contains(guide.trim()), "the whole guide: {text}");
+        assert!(text.contains("THIS MACHINE\n  GPU 0: Test GPU; CUDA_VISIBLE_DEVICES=GPU-test [nvidia], 12 GB VRAM\n  RAM: 32 GB    CPUs: 16"), "{text}");
+        assert!(text.contains(key), "{text}");
+        assert!(text.len() < 10_000, "keep session-start context small: {} characters", text.len());
+    }
 }
 
 #[test]
@@ -216,22 +225,28 @@ fn commands(cfg: &Value) -> Vec<String> {
     out
 }
 
-/// Installer against copies of the real client configs (the real files are only read).
+/// Installer against client configs that already hold other tools' hooks and an older install.
 #[test]
 fn install_replaces_only_our_hooks() {
-    let real = PathBuf::from(std::env::var_os("USERPROFILE").unwrap());
     let h = home("install");
-    for rel in [".claude/settings.json", ".codex/hooks.json"] {
-        if !real.join(rel).exists() {
-            eprintln!("skipped: {rel} not present");
-            return;
-        }
+    let other = |cmd: &str| json!({"hooks": [{"type": "command", "command": cmd}]});
+    let old = |event: &str| json!({"hooks": [{"type": "command", "command": format!("\"/old/bin/resource-ledger\" hook claude {event}")}]});
+    let claude = json!({
+        "model": "x",
+        "hooks": {
+            "SessionStart": [other("orca-hook start"), old("start")],
+            "Stop": [{"hooks": [{"type": "command", "command": "herdr notify"}, {"type": "command", "command": "C:/old/resource-ledger.exe hook claude stop"}]}],
+            "UserPromptSubmit": [old("prompt")],
+        },
+    });
+    let codex = json!({"hooks": {"Stop": [other("orca-hook codex-stop")]}});
+    for (rel, cfg) in [(".claude/settings.json", &claude), (".codex/hooks.json", &codex)] {
         std::fs::create_dir_all(h.join(rel).parent().unwrap()).unwrap();
-        std::fs::copy(real.join(rel), h.join(rel)).unwrap();
+        std::fs::write(h.join(rel), cfg.to_string()).unwrap();
     }
     let read = |rel: &str| serde_json::from_str::<Value>(&std::fs::read_to_string(h.join(rel)).unwrap()).unwrap();
     let install = |client: &str| {
-        let o = cmd(&h, &["install", client]).env("USERPROFILE", &h).output().unwrap();
+        let o = cmd(&h, &["install", client]).env("USERPROFILE", &h).env("HOME", &h).output().unwrap();
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     };
 
@@ -239,10 +254,11 @@ fn install_replaces_only_our_hooks() {
     install("claude");
     let after = read(".claude/settings.json");
     let kept: Vec<String> = commands(&before).into_iter().filter(|c| !c.contains("resource-ledger")).collect();
-    assert!(kept.iter().all(|c| commands(&after).contains(c)), "Orca/herdr hooks must survive");
+    assert!(kept.len() == 2 && kept.iter().all(|c| commands(&after).contains(c)), "Orca/herdr hooks must survive");
     let ours: Vec<String> = commands(&after).into_iter().filter(|c| c.contains("resource-ledger")).collect();
     assert_eq!(ours.len(), 5, "{ours:?}"); // earlier resource-ledger hooks were replaced, not kept
-    assert!(ours.iter().all(|c| !c.contains('\\') && !c.ends_with(" prompt")), "{ours:?}");
+    assert!(ours.iter().all(|c| !c.contains('\\') && !c.contains("/old/")), "{ours:?}");
+    assert!(after["hooks"].get("UserPromptSubmit").is_none(), "an event only we used is dropped");
     let stop: Vec<&Value> = after["hooks"]["Stop"].as_array().unwrap().iter()
         .flat_map(|g| g["hooks"].as_array().unwrap()).filter(|x| x["command"].as_str().unwrap().contains("resource-ledger")).collect();
     assert!(stop.len() == 1 && stop[0]["asyncRewake"] == true && stop[0]["timeout"] == 86400);
@@ -257,9 +273,11 @@ fn install_replaces_only_our_hooks() {
     let after = read(".codex/hooks.json");
     assert!(commands(&before).iter().filter(|c| !c.contains("resource-ledger")).all(|c| commands(&after).contains(c)));
     assert_eq!(commands(&after).iter().filter(|c| c.contains("resource-ledger")).count(), 3);
-    assert!(after["hooks"]["Stop"].as_array().unwrap().iter().any(|g| g["hooks"][0]["commandWindows"].is_string()));
+    let windows_cmd = after["hooks"]["Stop"].as_array().unwrap().iter().any(|g| g["hooks"][0]["commandWindows"].is_string());
+    assert_eq!(windows_cmd, cfg!(windows));
 
     install("opencode");
     let plugin = std::fs::read_to_string(h.join(".config/opencode/plugins/resource-ledger.js")).unwrap();
-    assert!(!plugin.contains("__RESOURCE_LEDGER_EXE__") && plugin.contains("/resource-ledger.exe\""));
+    let exe = format!("/resource-ledger{}\"", std::env::consts::EXE_SUFFIX);
+    assert!(!plugin.contains("__RESOURCE_LEDGER_EXE__") && plugin.contains(&exe));
 }

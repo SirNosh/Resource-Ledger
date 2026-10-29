@@ -1,31 +1,20 @@
-// resource-ledger OpenCode plugin: gives each session its ledger key and wakes idle
-// sessions when one of their reservations changes state (granted, out of time,
-// expired). Installed by `resource-ledger install opencode`, which fills in RESOURCE_LEDGER.
+// resource-ledger OpenCode plugin: gives each session the ledger's guide and its key, and
+// wakes idle sessions when one of their reservations changes state (granted, out of
+// time, expired). Installed by `resource-ledger install opencode`, which fills in RESOURCE_LEDGER.
 import { execFile } from "node:child_process";
 
 const RESOURCE_LEDGER = "__RESOURCE_LEDGER_EXE__";
 const POLL_MS = 15000;
 const RESOURCE_LEDGER_CMD = /(^|[\s;&|(`])resource-ledger(\.exe)?(\s|$)/;
 
-const INTRO = (key) =>
-  "[resource-ledger] This machine has a shared resource ledger that every agent session (Claude Code, " +
-  "Codex, OpenCode) uses so GPU/RAM/CPU-heavy work does not collide. Before starting heavy work " +
-  "(training or fine-tuning, GPU inference or model servers, eval sweeps, big builds or test " +
-  "suites, anything holding several GB of RAM or several cores for more than a few minutes), " +
-  "reserve it with `resource-ledger request --vram GB --ram GB --cpus N --minutes M --purpose \"what it is\"`. " +
-  "If GRANTED: do the work, then `resource-ledger release ID` as soon as it is done, even if time is left. " +
-  "One ticket is one task: any further work needs a new request, which joins the queue; " +
-  "`resource-ledger extend ID MINUTES` is only for the same task running long. " +
-  "If QUEUED: do not start that work; end your turn and you will be woken when it is your turn. " +
-  "`resource-ledger help` explains everything. " +
-  `Your session key is ${key} (applied automatically).`;
-
-function poll(key) {
+function hook(event, key) {
   return new Promise((resolve) =>
-    execFile(RESOURCE_LEDGER, ["hook", "opencode", "poll", "--session", key], { windowsHide: true, timeout: 30000 },
-      (err, stdout) => {
-        try { resolve(err ? null : JSON.parse(stdout)); } catch { resolve(null); }
-      }));
+    execFile(RESOURCE_LEDGER, ["hook", "opencode", event, "--session", key], { windowsHide: true, timeout: 30000 },
+      (err, stdout) => resolve(err ? null : stdout)));
+}
+
+async function poll(key) {
+  try { return JSON.parse(await hook("poll", key)); } catch { return null; }
 }
 
 export const ResourceLedgerPlugin = async ({ client }) => {
@@ -33,6 +22,7 @@ export const ResourceLedgerPlugin = async ({ client }) => {
   const tracked = new Set(); // sessions that have run resource-ledger
   const idle = new Map(); // sessionID -> boolean
   const pending = new Map(); // sessionID -> [notice text]
+  const intros = new Map(); // sessionID -> promise of the guide, this machine's pool and the key
   let timer = null;
 
   async function flush(id) {
@@ -76,7 +66,12 @@ export const ResourceLedgerPlugin = async ({ client }) => {
       if (input.sessionID) output.env.RESOURCE_LEDGER_SESSION = key(input.sessionID);
     },
     "experimental.chat.system.transform": async (input, output) => {
-      if (input.sessionID) output.system.push(INTRO(key(input.sessionID)));
+      const id = input.sessionID;
+      if (!id) return;
+      if (!intros.has(id)) intros.set(id, hook("intro", key(id)));
+      const text = await intros.get(id);
+      if (text) output.system.push(text.trim());
+      else intros.delete(id); // try again on the next message
     },
   };
 };

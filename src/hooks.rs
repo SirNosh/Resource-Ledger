@@ -3,7 +3,7 @@
 //! Claude Code: start (SessionStart), pre (PreToolUse), post (PostToolUse),
 //! stop (Stop, run with asyncRewake), end (SessionEnd).
 //! Codex: start, post, stop (a synchronous long-poll).
-//! OpenCode: poll --session KEY (called by the plugin).
+//! OpenCode: intro --session KEY and poll --session KEY (called by the plugin).
 //!
 //! A hook must never break the agent: any error is logged to hook-errors.log and
 //! the hook exits 0 with no output. Unknown events are no-ops.
@@ -36,9 +36,13 @@ pub fn run(client: &str, event: &str, session: Option<&str>) -> i32 {
 
 fn dispatch(client: &str, event: &str, session: Option<&str>) -> Result<i32, String> {
     if client == "opencode" {
-        if let ("poll", Some(key)) = (event, session) {
-            let p = ledger::with(|st| Ok(st.poll(ledger::now(), key)))?;
-            println!("{}", json!({"notices": p.notices, "open": p.open}));
+        match (event, session) {
+            ("intro", Some(key)) => println!("{}", intro(key, true)),
+            ("poll", Some(key)) => {
+                let p = ledger::with(|st| Ok(st.poll(ledger::now(), key)))?;
+                println!("{}", json!({"notices": p.notices, "open": p.open}));
+            }
+            _ => {}
         }
         return Ok(0);
     }
@@ -68,7 +72,7 @@ fn claude(event: &str, key: &str, data: &Value) -> Result<i32, String> {
             let home = ledger::home();
             fs::create_dir_all(&home).map_err(err)?;
             let name: String = key.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-            let lock = OpenOptions::new().create(true).write(true).open(home.join(format!("wait-{name}.lock"))).map_err(err)?;
+            let lock = OpenOptions::new().create(true).write(true).truncate(false).open(home.join(format!("wait-{name}.lock"))).map_err(err)?;
             match lock.try_lock() {
                 Ok(()) => {}
                 Err(fs::TryLockError::WouldBlock) => return Ok(0), // this session already has a live waiter
@@ -84,7 +88,10 @@ fn claude(event: &str, key: &str, data: &Value) -> Result<i32, String> {
             eprintln!("{text}");
             return Ok(2);
         }
-        "end" => ledger::with(|st| Ok(st.end_session(ledger::now(), key)))?,
+        "end" => ledger::with(|st| {
+            st.end_session(ledger::now(), key);
+            Ok(())
+        })?,
         _ => {}
     }
     Ok(0)
@@ -111,25 +118,25 @@ fn codex(event: &str, key: &str) -> Result<i32, String> {
     Ok(0)
 }
 
-const INTRO: &str = "[resource-ledger] This machine has a shared resource ledger that every agent session \
-(Claude Code, Codex, OpenCode) uses so GPU/RAM/CPU-heavy work does not collide. Before starting heavy \
-work (training or fine-tuning, GPU inference or model servers, eval sweeps, big builds or test suites, \
-anything holding several GB of RAM or several cores for more than a few minutes), reserve it:\n  \
-resource-ledger request --vram GB --ram GB --cpus N --minutes M --purpose \"what it is\"";
-
+/// What an agent is told when its session starts: the whole guide, this machine's
+/// resources, and its session key. The machine part is skipped if it cannot be read.
 fn intro(key: &str, stamped: bool) -> String {
-    let (flag, how) = if stamped {
-        (String::new(), " (applied automatically)")
+    let pool = match ledger::with(|st| Ok(st.pool(ledger::now()))) {
+        Ok(p) => format!("\n\n{p}"),
+        Err(e) => {
+            log(&format!("intro: {e}"));
+            String::new()
+        }
+    };
+    let how = if stamped {
+        " (applied to your resource-ledger commands automatically)".to_string()
     } else {
-        (format!(" --session {key}"), "; pass `--session` with it on every resource-ledger request")
+        format!("\n  Add `--session {key}` to every resource-ledger request.")
     };
     format!(
-        "{INTRO}{flag}\nIf GRANTED: do the work, then `resource-ledger release ID` as soon as it is done, \
-         even if time is left. One ticket is one task: any further work needs a new request, which joins \
-         the queue; `resource-ledger extend ID MINUTES` is only for the same task running long. If QUEUED: \
-         do not start that work; end your turn and you will be woken when it is your turn. \
-         `resource-ledger status` shows the queue; `resource-ledger help` explains everything. \
-         Your session key is {key}{how}.")
+        "[resource-ledger] This machine has a shared resource ledger for GPU/RAM/CPU-heavy work. \
+         Its guide (also `resource-ledger help`):\n\n{}{pool}\n\nYOUR SESSION KEY\n  {key}{how}",
+        crate::HELP)
 }
 
 fn notices(key: &str) -> Result<String, String> {
