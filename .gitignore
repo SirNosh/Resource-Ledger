@@ -1,0 +1,4 @@
+target/
+# private research state, never published
+project.md
+timeline.md

@@ -1,0 +1,17 @@
+[package]
+name = "resource-ledger"
+version = "0.2.0"
+edition = "2024"
+description = "A shared, advisory resource ledger (GPU memory, RAM, CPUs) for the coding-agent sessions on one machine"
+repository = "https://github.com/SirNosh/Resource-Ledger"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
