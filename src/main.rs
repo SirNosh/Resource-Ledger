@@ -62,7 +62,7 @@ COMMANDS
                       left or estimated start), then the last 20 closed ones (released, cancelled or
                       expired). --json prints it as JSON.
                       --watch (status, ledger) redraws every 2 s until Ctrl-C. It never exits, so it
-                      is for people only; agents are refused.
+                      is for people only: agents must not use it (inside Claude Code it is refused).
   help                This guide. -h and --help work anywhere.
   install claude|codex|opencode
                       One-time setup by a person: adds the hooks or plugin to that client.
