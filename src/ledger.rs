@@ -4,7 +4,7 @@
 //! applies the clock (out of time, forced expiry) and grants whatever the plan
 //! places at `now`; sessions waiting for a turn poll, so something drives the
 //! clock while it matters. A ticket is queued until granted, then held until it
-//! is released or expires. Closed tickets are dropped from the file.
+//! is released or expires. The last HISTORY closed tickets are kept for `status`.
 //!
 //! The resources are each GPU's VRAM, RAM and CPUs. Agents' estimates are trusted:
 //! what the machine reports in use beyond the grants is "outside use" (the person at
@@ -26,7 +26,7 @@ const GRACE_S: f64 = 15.0 * 60.0; // a grant is force-expired this long after it
 const WARMUP_S: f64 = 180.0; // a grant this young may not show up in the readings yet
 const PROBE_CACHE_S: f64 = 5.0;
 const MAX_NOTICES: usize = 100; // undeliverable notices (crashed sessions) must not pile up
-const HISTORY: usize = 20; // closed tickets kept for `resource-ledger ledger`
+const HISTORY: usize = 20; // closed tickets kept for `resource-ledger status`
 
 /// What one task asks for.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -38,6 +38,9 @@ pub struct Need {
     pub on: Vec<String>,
     pub ram: f64,
     pub cpus: f64,
+    /// Already running when filed (--running): granted at once, and already in the readings.
+    #[serde(default)]
+    pub running: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -355,12 +358,12 @@ impl State {
         }
     }
 
-    /// Per resource, what the machine reports in use beyond the grants old enough to
-    /// show up in the readings, never below 0. A reading the driver does not give
-    /// counts as no outside use.
+    /// Per resource, what the machine reports in use beyond the grants that show up in
+    /// the readings (those old enough, or already running when filed), never below 0.
+    /// A reading the driver does not give counts as no outside use.
     fn outside(&self, p: &Probe, now: f64) -> Vec<f64> {
         let mut loaded = vec![0.0; p.gpus.len() + 2];
-        for t in self.tickets.iter().filter(|t| t.granted.is_some_and(|g| g <= now - WARMUP_S)) {
+        for t in self.tickets.iter().filter(|t| t.granted.is_some_and(|g| t.need.running || g <= now - WARMUP_S)) {
             add(&mut loaded, &held(p, t));
         }
         let measured = p.gpus.iter().map(|g| if g.unified { None } else { g.used }).chain([Some(p.ram_used), Some(p.cpus_busy)]);
@@ -518,7 +521,7 @@ impl State {
             return Err("request at least one of --vram, --ram, --cpus".into());
         }
         let p = self.readings(now);
-        let mut unified_vram = 0.0;
+        let (mut unified_vram, mut gpus) = (0.0, Vec::new());
         if need.vram <= EPS {
             if need.gpus > 0 || gpu.is_some() {
                 return Err("--gpus and --gpu go with --vram (GB of VRAM per GPU)".into());
@@ -545,6 +548,14 @@ impl State {
                     "this needs {} GPU(s) with {} GB VRAM each, but only {} of the GPUs it may use have that much:{}",
                     need.gpus, r1(need.vram), fit.len(), gpu_list(&p)));
             }
+            if need.running {
+                if eligible.len() != need.gpus {
+                    return Err(format!(
+                        "say which GPU(s) the running work is on: --gpu NUMBERS, one per --gpus (e.g. --gpu 0). Its GPUs:{}",
+                        gpu_list(&p)));
+                }
+                gpus = eligible.iter().map(|&i| p.gpus[i].id.clone()).collect();
+            }
             if gpu.is_some() {
                 need.on = eligible.iter().map(|&i| p.gpus[i].id.clone()).collect();
             }
@@ -557,9 +568,10 @@ impl State {
         }
         self.next_id += 1;
         let id = self.next_id;
+        let granted = need.running.then_some(now); // running work is using the machine already
         self.tickets.push(Ticket {
             id, session: session.into(), purpose: purpose.into(), need, minutes,
-            granted: None, end: None, warned: false, gpus: Vec::new(),
+            granted, end: granted.map(|g| g + minutes * 60.0), warned: false, gpus,
         });
         let starts = self.tick(now);
         self.notices.retain(|n| n.ticket != id); // an immediate grant is reported by this reply
@@ -591,9 +603,16 @@ impl State {
         Ok(self.line_of(id, &starts, now))
     }
 
-    pub fn status(&mut self, now: f64) -> String {
+    /// The ledger for people and agents: each GPU, RAM and CPUs (held, and in use outside
+    /// the ledger), every open ticket, then the last closed ones, newest first. Text, or JSON.
+    pub fn status(&mut self, now: f64, as_json: bool) -> Result<String, String> {
         let starts = self.tick(now);
         let p = self.readings(now);
+        let closed: Vec<&Closed> = self.closed.iter().rev().collect();
+        if as_json {
+            let v = json!({"now": now, "machine": p, "open": self.tickets, "starts": starts, "closed": closed});
+            return serde_json::to_string_pretty(&v).map_err(err);
+        }
         let n = p.gpus.len();
         let outside = self.outside(&p, now);
         let mut holding = vec![0.0; n + 2];
@@ -615,24 +634,6 @@ impl State {
             out += "GPUs   none the ledger can see\n";
         }
         out += &format!("RAM    {} GB, {}\nCPUs   {}, {}", r1(p.ram_total), usage(n), p.cpus, usage(n + 1));
-        for t in &self.tickets {
-            out += &format!("\n  {}  <{}>", self.line(t, &starts, now), t.session);
-        }
-        if self.tickets.is_empty() {
-            out += "\n  (no open reservations)";
-        }
-        out
-    }
-
-    /// The ledger for people and agents: every open ticket, then the last closed ones,
-    /// newest first. A table, or JSON.
-    pub fn ledger(&mut self, now: f64, as_json: bool) -> Result<String, String> {
-        let starts = self.tick(now);
-        let closed: Vec<&Closed> = self.closed.iter().rev().collect();
-        if as_json {
-            let v = json!({"now": now, "open": self.tickets, "starts": starts, "closed": closed});
-            return serde_json::to_string_pretty(&v).map_err(err);
-        }
         let mut open = vec![["#", "state", "session", "needs", "GPUs", "time", "purpose"].map(String::from).to_vec()];
         for t in &self.tickets {
             let time = match t.end {
@@ -651,7 +652,7 @@ impl State {
             done.push(vec![t.id.to_string(), c.how.clone(), short(&t.session), fmt_need(&t.need), self.gpu_numbers(&t.gpus), ago, held_for, t.purpose.clone()]);
         }
         Ok(format!(
-            "{}\n\n{}",
+            "{out}\n\n{}\n\n{}",
             section("OPEN", &self.tickets.len().to_string(), &open),
             section("CLOSED", &format!("newest first; the ledger keeps the last {HISTORY}"), &done)))
     }
@@ -904,7 +905,7 @@ mod tests {
             req(&mut st, "s:a", [8.0, 0.0, 0.0], 60.0, T0);
         }
         assert_eq!([gpus_of(&st, 1), gpus_of(&st, 2), gpus_of(&st, 3)], [["g0"], ["g1"], ["g0"]]);
-        assert!(st.status(T0).contains("GPU 0  Test g0: 24 GB VRAM, held 16"));
+        assert!(st.status(T0, false).unwrap().contains("GPU 0  Test g0: 24 GB VRAM, held 16"));
     }
 
     #[test]
@@ -1001,30 +1002,66 @@ mod tests {
     }
 
     #[test]
-    fn ledger_view_lists_open_then_closed() {
+    fn status_lists_machine_open_and_closed() {
         let mut st = fresh();
-        assert_eq!(st.ledger(T0, false).unwrap(), "OPEN: none\n\nCLOSED: none");
+        assert!(st.status(T0, false).unwrap().ends_with("CPUs   16, held 0, in use outside the ledger 0\n\nOPEN: none\n\nCLOSED: none"));
         req(&mut st, "claude:5c1e7a42-8b3d-4f06", [8.0, 16.0, 4.0], 90.0, T0); // #1 granted on GPU 0
         req(&mut st, "codex:0199a2b3-aaaa", [0.0, 0.0, 16.0], 30.0, T0); // #2 queued until #1 ends
         req(&mut st, "s:x", [0.0, 0.0, 1.0], 10.0, T0); // #3 backfilled
         st.release(T0 + 5.0 * MIN, 3).unwrap();
-        let v = st.ledger(T0 + 30.0 * MIN, false).unwrap();
+        let v = st.status(T0 + 30.0 * MIN, false).unwrap();
         let lines: Vec<&str> = v.lines().collect();
-        assert_eq!(lines[0], "OPEN (2)");
-        assert_eq!(lines[2], "  1  granted  claude:5c1e7a42  8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h left        job");
-        assert!(lines[3].starts_with("  2  queued   codex:0199a2b3   16 CPUs ") && lines[3].ends_with("starts in ~1 h  job"), "{v}");
-        assert_eq!(lines[5], "CLOSED (newest first; the ledger keeps the last 20)");
-        assert_eq!(lines[7], "  3  released  s:x      1 CPUs        25 min ago  5 min     job");
+        assert_eq!(lines[0], "GPU 0  Test g0: 12 GB VRAM, held 8, in use outside the ledger 0");
+        assert_eq!(lines[4], "OPEN (2)");
+        assert_eq!(lines[6], "  1  granted  claude:5c1e7a42  8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h left        job");
+        assert!(lines[7].starts_with("  2  queued   codex:0199a2b3   16 CPUs ") && lines[7].ends_with("starts in ~1 h  job"), "{v}");
+        assert_eq!(lines[9], "CLOSED (newest first; the ledger keeps the last 20)");
+        assert_eq!(lines[11], "  3  released  s:x      1 CPUs        25 min ago  5 min     job");
 
-        let j: serde_json::Value = serde_json::from_str(&st.ledger(T0 + 30.0 * MIN, true).unwrap()).unwrap();
+        let j: serde_json::Value = serde_json::from_str(&st.status(T0 + 30.0 * MIN, true).unwrap()).unwrap();
+        assert_eq!(j["machine"]["cpus"], 16.0);
         assert_eq!(j["open"][0]["session"], "claude:5c1e7a42-8b3d-4f06");
         assert_eq!(j["starts"]["2"], T0 + 90.0 * MIN);
         assert!(j["closed"][0]["id"] == 3 && j["closed"][0]["how"] == "released" && j["closed"][0]["closed_at"] == T0 + 5.0 * MIN);
     }
 
     #[test]
-    fn a_ledger_from_before_history_still_loads() {
-        let st: State = serde_json::from_str(r#"{"next_id":3,"probe":null,"tickets":[],"notices":[]}"#).unwrap();
-        assert!(st.next_id == 3 && st.closed.is_empty());
+    fn a_ledger_from_before_history_and_running_still_loads() {
+        let st: State = serde_json::from_str(
+            r#"{"next_id":3,"probe":null,"notices":[],"tickets":[{"id":3,"session":"s:a","purpose":"job",
+            "need":{"vram":0.0,"gpus":0,"on":[],"ram":2.0,"cpus":1.0},"minutes":5.0,"granted":null,"end":null,"warned":false,"gpus":[]}]}"#,
+        )
+        .unwrap();
+        assert!(st.next_id == 3 && st.closed.is_empty() && !st.tickets[0].need.running);
+    }
+
+    fn running(st: &mut State, session: &str, v: [f64; 3], gpu: Option<&str>, minutes: f64, now: f64) -> Result<String, String> {
+        st.request(now, session, Need { running: true, ..need(v) }, gpu, minutes, "job")
+    }
+
+    #[test]
+    fn running_work_is_granted_at_once_and_not_counted_twice() {
+        let mut st = fresh();
+        machine(vec![gpu("g0", "nvidia", 12.0, 0.0)], 0.0, 12.0); // a 12-CPU build nobody filed
+        let a = req(&mut st, "s:a", [0.0, 0.0, 8.0], 30.0, T0);
+        assert!(a.contains("[queued]") && a.contains("outside the ledger"), "{a}");
+        // the build's agent logs it: granted at once, though a is waiting
+        let b = running(&mut st, "s:b", [0.0, 0.0, 12.0], None, 20.0, T0).unwrap();
+        assert!(b.contains("[granted]") && b.contains("GRANTED: 20 min left"), "{b}");
+        // the 12 busy CPUs are b's, not outside use as well, so a starts when b ends
+        let a = st.lines_for(T0 + 1.0, "s:a");
+        assert!(a.contains("estimated start in 20 min"), "{a}");
+    }
+
+    #[test]
+    fn running_gpu_work_must_name_its_gpus() {
+        let mut st = fresh();
+        machine(vec![gpu("g0", "nvidia", 12.0, 0.0), gpu("g1", "nvidia", 12.0, 11.0)], 0.0, 0.0);
+        let e = running(&mut st, "s:a", [10.0, 0.0, 0.0], None, 30.0, T0).unwrap_err();
+        assert!(e.contains("--gpu NUMBERS") && e.contains("GPU 1"), "{e}");
+        // g1 reads nearly full, but that use is this job
+        let a = running(&mut st, "s:a", [10.0, 0.0, 0.0], Some("1"), 30.0, T0).unwrap();
+        assert!(a.contains("[granted]") && a.contains("on GPU 1 (Test g1)"), "{a}");
+        assert_eq!(st.status(T0, false).unwrap().lines().nth(1), Some("GPU 1  Test g1: 12 GB VRAM, held 10, in use outside the ledger 1"));
     }
 }

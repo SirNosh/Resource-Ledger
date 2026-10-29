@@ -79,7 +79,7 @@ resource-ledger install opencode    # OpenCode: plugin in ~/.config/opencode/plu
 Agents learn how to use the ledger in two ways:
 - **Clients with hooks:** every new session starts with the full guide (the text of
   `resource-ledger help`), this machine's GPUs, RAM and CPUs, and the session's key. That is
-  about 5,000 characters. Claude Code also gets it again after the conversation is compacted.
+  about 6,000 characters. Claude Code also gets it again after the conversation is compacted.
 - **Any agent:** `resource-ledger help` prints the full guide.
 
 The protocol is **one ticket = one task**:
@@ -91,6 +91,10 @@ The protocol is **one ticket = one task**:
 3. **When the task is done, release it straight away,** even if time is left: `resource-ledger release 7`.
 4. **For further work, make a new request,** which joins the queue behind the requests already
    waiting. `resource-ledger extend 7 30` is only for the same task when it runs past its minutes.
+
+**Forgot?** If heavy work is already running without a ticket, the agent logs it with the same
+request plus `--running`. It is granted at once, since the work is already using the machine, and
+is released like any other ticket.
 
 What counts as heavy work:
 - training or fine-tuning;
@@ -113,11 +117,10 @@ request ─► QUEUED ──(its turn, and it fits beside use outside the ledger
 ## Commands
 
 ```
-resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--session KEY]
+resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--running] [--session KEY]
 resource-ledger release ID
 resource-ledger extend ID MINUTES
-resource-ledger status [--watch]
-resource-ledger ledger [--json] [--watch]
+resource-ledger status [--json] [--watch]
 resource-ledger help                      (also -h / --help, anywhere)
 resource-ledger install claude|codex|opencode
 resource-ledger hook CLIENT EVENT         (run by the installed hooks; not for direct use)
@@ -129,6 +132,10 @@ resource-ledger hook CLIENT EVENT         (run by the installed hooks; not for d
 - `--gpu WHICH` limits the GPUs it may use: a vendor (`nvidia`, `amd`, `intel`, `apple`) or GPU
   numbers as `status` lists them (`0`, or `0,2`). It is required on a machine whose GPUs come
   from more than one vendor (see [GPUs](#gpus)).
+- `--running` logs a task that is already running without a ticket. It is granted at once, even
+  past the queue; `--minutes` is how much longer it runs. With `--vram`, `--gpu` must name the
+  GPUs it runs on, one per `--gpus` (on a one-GPU machine it can be left out). Its use is already
+  in the readings, so it is not also counted as use outside the ledger.
 - A request no GPU or the machine could ever hold is refused, with the list of GPUs.
 - It prints one ticket line. The ticket ID follows the `#`, and a grant names its GPUs:
 
@@ -141,29 +148,23 @@ resource-ledger hook CLIENT EVENT         (run by the installed hooks; not for d
 
 **`extend`** adds time to the same task. Requests behind it may start later.
 
-**`status`** shows each GPU, RAM and CPUs, with what grants hold and what is in use outside the
-ledger, then every open ticket with the session it belongs to:
+**`status`** shows the ledger, for people and agents alike: each GPU, RAM and CPUs, with what
+grants hold and what is in use outside the ledger; every open ticket; then the last 20 closed
+ones, newest first. A ticket closes when it is released, cancelled (released while queued, or its
+session ended) or force-expired. Sessions are shortened to `client:` plus 8 characters of the id;
+`--json` gives the full key.
 
 ```
-GPU 0  NVIDIA GeForce RTX 4090; CUDA_VISIBLE_DEVICES=GPU-1a2b: 24 GB VRAM, held 0, in use outside the ledger 1.2
-GPU 1  NVIDIA GeForce RTX 4090; CUDA_VISIBLE_DEVICES=GPU-3c4d: 24 GB VRAM, held 20, in use outside the ledger 0.4
+GPU 0  NVIDIA GeForce RTX 4090; CUDA_VISIBLE_DEVICES=GPU-1a2b: 24 GB VRAM, held 8, in use outside the ledger 1.2
+GPU 1  NVIDIA GeForce RTX 4090; CUDA_VISIBLE_DEVICES=GPU-3c4d: 24 GB VRAM, held 0, in use outside the ledger 0.4
 RAM    64 GB, held 16, in use outside the ledger 9.5
 CPUs   32, held 28, in use outside the ledger 2.3
-  #1 [granted] 20 GB VRAM, 16 GB RAM, 4 CPUs for 90 min: LoRA finetune on GPU 1 (...). GRANTED: 1 h 30 min left. ...  <claude:3f2a>
-  #2 [queued] 8 GB VRAM on each of 2 GPUs for 60 min: DDP eval. QUEUED: position 1, estimated start in 1 h 30 min. ...  <codex:9b1c>
-  #3 [granted] 24 CPUs for 30 min: test suite. GRANTED: 30 min left. ...  <opencode:77e0>
-```
 
-**`ledger`** shows the ledger as a table, for people and agents alike: every open ticket, then the
-last 20 closed ones, newest first. A ticket closes when it is released, cancelled (released while
-queued, or its session ended) or force-expired. Sessions are shortened to `client:` plus 8
-characters of the id; `status` and `--json` give the full key.
-
-```
-OPEN (2)
-  #   state    session          needs                         GPUs  time                   purpose
-  12  granted  claude:5c1e7a42  8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h 12 min left        LoRA finetune
-  13  queued   codex:0199a2b3   8 CPUs                              starts in ~1 h 12 min  test suite
+OPEN (3)
+  #   state    session            needs                         GPUs  time               purpose
+  12  granted  claude:5c1e7a42    8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h 12 min left    LoRA finetune
+  13  granted  opencode:ses_7f3a  24 CPUs                             30 min left        test suite
+  14  queued   codex:0199a2b3     8 CPUs                              starts in ~30 min  lint sweep
 
 CLOSED (newest first; the ledger keeps the last 20)
   #   how        session          needs    GPUs  closed      held for  purpose
@@ -171,11 +172,11 @@ CLOSED (newest first; the ledger keeps the last 20)
   10  cancelled  codex:0199a2b3   4 CPUs         1 h ago               flaky test rerun
 ```
 
-- **`--json`** prints `{"now", "open", "starts", "closed"}`: the open tickets, the estimated start
-  of each queued one (Unix seconds, keyed by ticket ID), and the closed tickets with `closed_at`
-  and `how`.
-- **`--watch`** (with `status` or `ledger`) redraws every 2 s until Ctrl-C. It never exits, so it
-  is for people at a terminal; inside Claude Code it is refused.
+- **`--json`** prints `{"now", "machine", "open", "starts", "closed"}`: the last machine reading,
+  the open tickets, the estimated start of each queued one (Unix seconds, keyed by ticket ID), and
+  the closed tickets with `closed_at` and `how`.
+- **`--watch`** redraws it every 2 s until Ctrl-C. It never exits, so it is for people at a
+  terminal; agents must not use it, and inside Claude Code it is refused.
 
 **Exit codes:** `0` means success; read the output for GRANTED or QUEUED. `2` means an error; the
 reason is on stderr, and a usage error points to `resource-ledger help`.
@@ -374,15 +375,17 @@ cargo test real_probe -- --ignored --nocapture    # this machine's real readings
 - **Unit tests** cover:
   - the scheduler's placement rules;
   - the ticket lifecycle on a fake clock: grants, notices, out of time, expiry, extend and session end;
-  - the closed-ticket history, and the `ledger` table and JSON;
+  - the closed-ticket history, and the `status` view and JSON;
+  - `--running`: granted at once, its GPUs named, and its use not counted twice;
   - several GPUs: spreading, multi-GPU requests, `--gpu`, the mixed-vendor rule and refusals;
   - outside use of VRAM and CPUs, and the 3-minute rule;
   - Apple's unified memory;
   - the readers, on recorded `nvidia-smi` output, sysfs trees (AMD, Intel, an integrated GPU),
     `/proc/stat` and `/proc/meminfo`.
 - **Integration tests** run the built exe the way hooks run it. They cover each hook event, the
-  session-start intro, help and errors, `ledger` (text, JSON and `--watch`), the installer (on
-  configs that also hold other tools' hooks), and an 8-process race that must never oversubscribe.
+  session-start intro, help and errors, `status` (text, JSON and `--watch`), `--running`, the
+  installer (on configs that also hold other tools' hooks), and an 8-process race that must never
+  oversubscribe.
 - **CI** (`.github/workflows/ci.yml`) runs both commands above on Linux, macOS and Windows.
 
 **Environment variables for testing:**

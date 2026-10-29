@@ -12,11 +12,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 const USAGE: &str = "usage:
-  resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--session KEY]
+  resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--running] [--session KEY]
   resource-ledger release ID
   resource-ledger extend ID MINUTES
-  resource-ledger status [--watch]
-  resource-ledger ledger [--json] [--watch]
+  resource-ledger status [--json] [--watch]
   resource-ledger install claude|codex|opencode
 Run `resource-ledger help` for the full guide.";
 
@@ -40,29 +39,32 @@ PROTOCOL: one ticket = one task
   3. Done:    resource-ledger release ID   as soon as the task finishes, even if time is left.
   4. More work afterwards needs a new request; it joins the queue behind earlier ones.
      Use `extend` only when the same task runs past its minutes.
+  Forgot? If heavy work is already running without a ticket, log it now: the same request
+  plus --running. It is granted at once; release it when the work finishes.
 
 COMMANDS
-  request --minutes M --purpose TEXT [--vram GB] [--gpus N] [--gpu WHICH] [--ram GB] [--cpus N] [--session KEY]
+  request --minutes M --purpose TEXT [--vram GB] [--gpus N] [--gpu WHICH] [--ram GB] [--cpus N] [--running] [--session KEY]
       Ask for resources for one task. Give at least one of --vram/--ram/--cpus; omitted ones
       are 0, and GB may be fractional. Estimate honestly: everyone else is scheduled around it.
         --vram GB    VRAM on each GPU the task uses.
         --gpus N     How many GPUs it uses, each with --vram GB (default 1).
         --gpu WHICH  The GPUs it may use: a vendor (nvidia, amd, intel, apple) or GPU numbers as
                      `status` lists them (0, or 0,2). Required if the GPUs are from several vendors.
+        --running    The task is already running without a ticket: log it, granted at once.
+                     --minutes is how much longer it runs; with --vram, --gpu names the GPUs
+                     it runs on (one per --gpus).
       Prints one ticket line; the ticket ID follows '#':
         #7 [granted] 8 GB VRAM, 16 GB RAM, 4 CPUs for 90 min: LoRA finetune on GPU 0 (NVIDIA GeForce
            RTX 4090; CUDA_VISIBLE_DEVICES=GPU-...). GRANTED: 1 h 30 min left. ...
         #8 [queued] 16 CPUs for 30 min: test suite. QUEUED: position 1, estimated start in 25 min. ...
   release ID          The task is done: free the grant, or cancel a queued request.
   extend ID MINUTES   The same task needs longer. Requests behind it may start later.
-  status [--watch]    Each GPU, RAM and CPUs (held, and in use outside the ledger), and every open
-                      ticket with its session.
-  ledger [--json] [--watch]
-                      The ledger as a table: every open ticket (state, session, needs, GPUs, time
-                      left or estimated start), then the last 20 closed ones (released, cancelled or
-                      expired). --json prints it as JSON.
-                      --watch (status, ledger) redraws every 2 s until Ctrl-C. It never exits, so it
-                      is for people only: agents must not use it (inside Claude Code it is refused).
+  status [--json] [--watch]
+                      Each GPU, RAM and CPUs (held, and in use outside the ledger), every open
+                      ticket (state, session, needs, GPUs, time left or estimated start), then the
+                      last 20 closed ones (released, cancelled or expired). --json prints it as JSON.
+                      --watch redraws it every 2 s until Ctrl-C. It never exits, so it is for
+                      people only: agents must not use it (inside Claude Code it is refused).
   help                This guide. -h and --help work anywhere.
   install claude|codex|opencode
                       One-time setup by a person: adds the hooks or plugin to that client.
@@ -98,8 +100,8 @@ EXIT CODES
 State: ledger.json in a resource-ledger folder under %LOCALAPPDATA% (Windows), ~/Library/Application
 Support (macOS), or $XDG_STATE_HOME, else ~/.local/state (Linux). RESOURCE_LEDGER_HOME overrides it."#;
 
-const FLAGS: [&str; 10] = ["vram", "gpus", "gpu", "ram", "cpus", "minutes", "purpose", "session", "json", "watch"];
-const SWITCHES: [&str; 2] = ["json", "watch"]; // options that take no value
+const FLAGS: [&str; 11] = ["vram", "gpus", "gpu", "ram", "cpus", "minutes", "purpose", "session", "running", "json", "watch"];
+const SWITCHES: [&str; 3] = ["running", "json", "watch"]; // options that take no value
 const WATCH: Duration = Duration::from_secs(2);
 
 fn main() {
@@ -111,7 +113,7 @@ fn main() {
     let code = match parse(&args) {
         Ok((pos, flags)) if pos.len() == 3 && pos[0] == "hook" => hooks::run(pos[1], pos[2], flags.get("session").copied()),
         Ok((pos, flags)) => {
-            let watch = flags.contains_key("watch") && matches!(pos.as_slice(), ["status"] | ["ledger"]);
+            let watch = flags.contains_key("watch") && pos == ["status"];
             #[cfg(windows)]
             if watch {
                 enable_vt();
@@ -188,7 +190,9 @@ fn command(pos: &[&str], flags: &HashMap<&str, &str>) -> Result<String, String> 
         ["request"] => {
             let get = |k: &str| flags.get(k).map_or(Ok(0.0), |v| num(v, &format!("--{k}")));
             let gpus = flags.get("gpus").map_or(Ok(0), |v| v.parse().map_err(|_| format!("--gpus must be a whole number, got `{v}`")))?;
-            let need = ledger::Need { vram: get("vram")?, gpus, ram: get("ram")?, cpus: get("cpus")?, ..Default::default() };
+            let need = ledger::Need {
+                vram: get("vram")?, gpus, ram: get("ram")?, cpus: get("cpus")?, running: flags.contains_key("running"), ..Default::default()
+            };
             let minutes = num(flags.get("minutes").ok_or("--minutes is required")?, "--minutes")?;
             let purpose = flags.get("purpose").ok_or("--purpose is required")?;
             let session = session(flags.get("session").copied())?;
@@ -202,8 +206,7 @@ fn command(pos: &[&str], flags: &HashMap<&str, &str>) -> Result<String, String> 
             let (t, m) = (id(t)?, num(m, "MINUTES")?);
             ledger::with(|st| st.extend(ledger::now(), t, m))
         }
-        ["status"] => ledger::with(|st| Ok(st.status(ledger::now()))),
-        ["ledger"] => ledger::with(|st| st.ledger(ledger::now(), flags.contains_key("json"))),
+        ["status"] => ledger::with(|st| st.status(ledger::now(), flags.contains_key("json"))),
         ["install", client] => install::run(client),
         _ => Err(USAGE.into()),
     }
