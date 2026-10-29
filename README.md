@@ -116,7 +116,8 @@ request ─► QUEUED ──(its turn, and it fits beside use outside the ledger
 resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--session KEY]
 resource-ledger release ID
 resource-ledger extend ID MINUTES
-resource-ledger status
+resource-ledger status [--watch]
+resource-ledger ledger [--json] [--watch]
 resource-ledger help                      (also -h / --help, anywhere)
 resource-ledger install claude|codex|opencode
 resource-ledger hook CLIENT EVENT         (run by the installed hooks; not for direct use)
@@ -152,6 +153,29 @@ CPUs   32, held 28, in use outside the ledger 2.3
   #2 [queued] 8 GB VRAM on each of 2 GPUs for 60 min: DDP eval. QUEUED: position 1, estimated start in 1 h 30 min. ...  <codex:9b1c>
   #3 [granted] 24 CPUs for 30 min: test suite. GRANTED: 30 min left. ...  <opencode:77e0>
 ```
+
+**`ledger`** shows the ledger as a table, for people and agents alike: every open ticket, then the
+last 20 closed ones, newest first. A ticket closes when it is released, cancelled (released while
+queued, or its session ended) or force-expired. Sessions are shortened to `client:` plus 8
+characters of the id; `status` and `--json` give the full key.
+
+```
+OPEN (2)
+  #   state    session          needs                         GPUs  time                   purpose
+  12  granted  claude:5c1e7a42  8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h 12 min left        LoRA finetune
+  13  queued   codex:0199a2b3   8 CPUs                              starts in ~1 h 12 min  test suite
+
+CLOSED (newest first; the ledger keeps the last 20)
+  #   how        session          needs    GPUs  closed      held for  purpose
+  11  released   claude:5c1e7a42  24 CPUs        12 min ago  40 min    build
+  10  cancelled  codex:0199a2b3   4 CPUs         1 h ago               flaky test rerun
+```
+
+- **`--json`** prints `{"now", "open", "starts", "closed"}`: the open tickets, the estimated start
+  of each queued one (Unix seconds, keyed by ticket ID), and the closed tickets with `closed_at`
+  and `how`.
+- **`--watch`** (with `status` or `ledger`) redraws every 2 s until Ctrl-C. It never exits, so it
+  is for people at a terminal; inside Claude Code it is refused.
 
 **Exit codes:** `0` means success; read the output for GRANTED or QUEUED. `2` means an error; the
 reason is on stderr, and a usage error points to `resource-ledger help`.
@@ -327,7 +351,7 @@ Set `RESOURCE_LEDGER_HOME` to use a different folder.
 
 | File | Purpose |
 |---|---|
-| `ledger.json` | The ledger: open tickets, undelivered notices and the last machine reading. Closed tickets are dropped, so it stays small. |
+| `ledger.json` | The ledger: open tickets, the last 20 closed ones, undelivered notices and the last machine reading. It stays small. |
 | `ledger.lock` | Exclusive lock held during every read-modify-write. |
 | `wait-<session>.lock` | Ensures at most one background waiter per Claude Code session. |
 | `hook-errors.log` | Hook errors. A hook never fails its agent. |
@@ -350,14 +374,15 @@ cargo test real_probe -- --ignored --nocapture    # this machine's real readings
 - **Unit tests** cover:
   - the scheduler's placement rules;
   - the ticket lifecycle on a fake clock: grants, notices, out of time, expiry, extend and session end;
+  - the closed-ticket history, and the `ledger` table and JSON;
   - several GPUs: spreading, multi-GPU requests, `--gpu`, the mixed-vendor rule and refusals;
   - outside use of VRAM and CPUs, and the 3-minute rule;
   - Apple's unified memory;
   - the readers, on recorded `nvidia-smi` output, sysfs trees (AMD, Intel, an integrated GPU),
     `/proc/stat` and `/proc/meminfo`.
 - **Integration tests** run the built exe the way hooks run it. They cover each hook event, the
-  session-start intro, help and errors, the installer (on configs that also hold other tools'
-  hooks), and an 8-process race that must never oversubscribe.
+  session-start intro, help and errors, `ledger` (text, JSON and `--watch`), the installer (on
+  configs that also hold other tools' hooks), and an 8-process race that must never oversubscribe.
 - **CI** (`.github/workflows/ci.yml`) runs both commands above on Linux, macOS and Windows.
 
 **Environment variables for testing:**

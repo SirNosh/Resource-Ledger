@@ -9,12 +9,14 @@ mod ledger;
 mod probe;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 const USAGE: &str = "usage:
   resource-ledger request --minutes M --purpose TEXT [--vram GB [--gpus N] [--gpu WHICH]] [--ram GB] [--cpus N] [--session KEY]
   resource-ledger release ID
   resource-ledger extend ID MINUTES
-  resource-ledger status
+  resource-ledger status [--watch]
+  resource-ledger ledger [--json] [--watch]
   resource-ledger install claude|codex|opencode
 Run `resource-ledger help` for the full guide.";
 
@@ -53,8 +55,14 @@ COMMANDS
         #8 [queued] 16 CPUs for 30 min: test suite. QUEUED: position 1, estimated start in 25 min. ...
   release ID          The task is done: free the grant, or cancel a queued request.
   extend ID MINUTES   The same task needs longer. Requests behind it may start later.
-  status              Each GPU, RAM and CPUs (held, and in use outside the ledger), and every open
+  status [--watch]    Each GPU, RAM and CPUs (held, and in use outside the ledger), and every open
                       ticket with its session.
+  ledger [--json] [--watch]
+                      The ledger as a table: every open ticket (state, session, needs, GPUs, time
+                      left or estimated start), then the last 20 closed ones (released, cancelled or
+                      expired). --json prints it as JSON.
+                      --watch (status, ledger) redraws every 2 s until Ctrl-C. It never exits, so it
+                      is for people only; agents are refused.
   help                This guide. -h and --help work anywhere.
   install claude|codex|opencode
                       One-time setup by a person: adds the hooks or plugin to that client.
@@ -90,7 +98,9 @@ EXIT CODES
 State: ledger.json in a resource-ledger folder under %LOCALAPPDATA% (Windows), ~/Library/Application
 Support (macOS), or $XDG_STATE_HOME, else ~/.local/state (Linux). RESOURCE_LEDGER_HOME overrides it."#;
 
-const FLAGS: [&str; 8] = ["vram", "gpus", "gpu", "ram", "cpus", "minutes", "purpose", "session"];
+const FLAGS: [&str; 10] = ["vram", "gpus", "gpu", "ram", "cpus", "minutes", "purpose", "session", "json", "watch"];
+const SWITCHES: [&str; 2] = ["json", "watch"]; // options that take no value
+const WATCH: Duration = Duration::from_secs(2);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,16 +110,27 @@ fn main() {
     }
     let code = match parse(&args) {
         Ok((pos, flags)) if pos.len() == 3 && pos[0] == "hook" => hooks::run(pos[1], pos[2], flags.get("session").copied()),
-        Ok((pos, flags)) => match command(&pos, &flags) {
-            Ok(out) => {
-                println!("{out}");
-                0
+        Ok((pos, flags)) => {
+            let watch = flags.contains_key("watch") && matches!(pos.as_slice(), ["status"] | ["ledger"]);
+            #[cfg(windows)]
+            if watch {
+                enable_vt();
             }
-            Err(e) => {
-                eprintln!("resource-ledger: {e}");
-                2
+            loop {
+                match command(&pos, &flags) {
+                    Ok(out) if watch => println!("\x1b[H\x1b[2J{out}"), // clear the screen, then redraw
+                    Ok(out) => {
+                        println!("{out}");
+                        break 0;
+                    }
+                    Err(e) => {
+                        eprintln!("resource-ledger: {e}");
+                        break 2;
+                    }
+                }
+                std::thread::sleep(WATCH);
             }
-        },
+        }
         Err(e) => {
             eprintln!("resource-ledger: {e}");
             2
@@ -118,12 +139,32 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Positional words, and `--name value` options.
+/// Let the Windows console act on escape codes. Best effort: it fails when stdout is
+/// not a console, where they need no handling.
+#[cfg(windows)]
+fn enable_vt() {
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+    // SAFETY: console calls on this process's own stdout handle, with a valid out-pointer.
+    unsafe {
+        let Ok(out) = GetStdHandle(STD_OUTPUT_HANDLE) else { return };
+        let mut mode = CONSOLE_MODE::default();
+        if GetConsoleMode(out, &mut mode).is_ok() {
+            let _ = SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
+/// Positional words, `--name value` options, and the SWITCHES, which take no value.
 fn parse(args: &[String]) -> Result<(Vec<&str>, HashMap<&str, &str>), String> {
     let (mut pos, mut flags) = (Vec::new(), HashMap::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.strip_prefix("--") {
+            Some(name) if SWITCHES.contains(&name) => {
+                flags.insert(name, "");
+            }
             Some(name) => {
                 let value = it.next().ok_or(format!("--{name} needs a value"))?;
                 flags.insert(name, value.as_str());
@@ -137,6 +178,9 @@ fn parse(args: &[String]) -> Result<(Vec<&str>, HashMap<&str, &str>), String> {
 fn command(pos: &[&str], flags: &HashMap<&str, &str>) -> Result<String, String> {
     if let Some(bad) = flags.keys().find(|k| !FLAGS.contains(k)) {
         return Err(format!("unknown option --{bad}\n{USAGE}"));
+    }
+    if flags.contains_key("watch") && std::env::var_os("CLAUDECODE").is_some() {
+        return Err("--watch never exits, so it is for people only; run the command without it.".into());
     }
     let num = |s: &str, what: &str| s.parse::<f64>().map_err(|_| format!("{what} must be a number, got `{s}`"));
     let id = |s: &str| s.parse::<u64>().map_err(|_| format!("ticket ID must be a number, got `{s}`"));
@@ -159,6 +203,7 @@ fn command(pos: &[&str], flags: &HashMap<&str, &str>) -> Result<String, String> 
             ledger::with(|st| st.extend(ledger::now(), t, m))
         }
         ["status"] => ledger::with(|st| Ok(st.status(ledger::now()))),
+        ["ledger"] => ledger::with(|st| st.ledger(ledger::now(), flags.contains_key("json"))),
         ["install", client] => install::run(client),
         _ => Err(USAGE.into()),
     }

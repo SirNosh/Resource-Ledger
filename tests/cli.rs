@@ -106,10 +106,30 @@ fn help_is_available_however_an_agent_asks() {
     let h = home("help");
     for args in [&[][..], &["help"], &["--help"], &["-h"], &["request", "--help"]] {
         let (code, out, _) = run(&h, args, "");
-        assert!(code == 0 && out.contains("PROTOCOL: one ticket = one task") && out.contains("EXIT CODES"), "{args:?}");
+        assert!(code == 0 && out.contains("PROTOCOL: one ticket = one task") && out.contains("ledger [--json] [--watch]"), "{args:?}");
     }
     let (code, _, err) = run(&h, &["frobnicate"], "");
     assert!(code == 2 && err.contains("Run `resource-ledger help`"), "{err}");
+}
+
+#[test]
+fn ledger_as_text_json_and_live() {
+    let h = home("ledger");
+    request(&h, "claude:5c1e7a42-8b3d", "16");
+    request(&h, "codex:0199a2b3-aa", "4");
+    ok(&h, &["release", "2"]);
+    let text = ok(&h, &["ledger"]);
+    assert!(text.contains("OPEN (1)") && text.contains("granted  claude:5c1e7a42") && text.contains("cancelled  codex:0199a2b3"), "{text}");
+    let j: Value = serde_json::from_str(&ok(&h, &["ledger", "--json"])).unwrap();
+    assert!(j["open"][0]["id"] == 1 && j["closed"][0]["how"] == "cancelled", "{j}");
+
+    let mut watcher = spawn(&h, &["ledger", "--watch"], "");
+    sleep(Duration::from_millis(4500)); // two redraws 2 s apart, with slack for a busy machine
+    watcher.kill().unwrap();
+    let out = String::from_utf8_lossy(&watcher.wait_with_output().unwrap().stdout).into_owned();
+    assert!(out.matches("\x1b[H\x1b[2JOPEN (1)").count() >= 2, "{out}");
+    let o = cmd(&h, &["ledger", "--watch"]).env("CLAUDECODE", "1").output().unwrap();
+    assert!(o.status.code() == Some(2) && String::from_utf8_lossy(&o.stderr).contains("--watch never exits"));
 }
 
 #[test]

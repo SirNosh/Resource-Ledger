@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::probe::{self, Gpu, Probe};
 
@@ -25,6 +26,7 @@ const GRACE_S: f64 = 15.0 * 60.0; // a grant is force-expired this long after it
 const WARMUP_S: f64 = 180.0; // a grant this young may not show up in the readings yet
 const PROBE_CACHE_S: f64 = 5.0;
 const MAX_NOTICES: usize = 100; // undeliverable notices (crashed sessions) must not pile up
+const HISTORY: usize = 20; // closed tickets kept for `resource-ledger ledger`
 
 /// What one task asks for.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -59,12 +61,25 @@ pub struct Notice {
     pub text: String,
 }
 
+/// A ticket that is no longer open.
+#[derive(Serialize, Deserialize)]
+pub struct Closed {
+    #[serde(flatten)]
+    pub ticket: Ticket,
+    pub closed_at: f64,
+    /// released, cancelled or expired.
+    pub how: String,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct State {
     next_id: u64,
     probe: Option<Probe>,
     tickets: Vec<Ticket>,
     notices: Vec<Notice>,
+    /// The last HISTORY closed tickets, oldest first. Ledgers written before 0.4 lack it.
+    #[serde(default)]
+    closed: Vec<Closed>,
 }
 
 pub struct Polled {
@@ -303,6 +318,31 @@ fn dur(secs: f64) -> String {
     }
 }
 
+/// A session key cut to its client and 8 characters of its id, e.g. `claude:5c1e7a42`.
+fn short(session: &str) -> String {
+    match session.split_once(':') {
+        Some((client, id)) => format!("{client}:{}", id.chars().take(8).collect::<String>()),
+        None => session.into(),
+    }
+}
+
+/// `NAME: none`, or `NAME (detail)` over the rows (the first is the header) as a table
+/// whose columns are padded to their widest cell.
+fn section(name: &str, detail: &str, rows: &[Vec<String>]) -> String {
+    if rows.len() < 2 {
+        return format!("{name}: none");
+    }
+    let widths: Vec<usize> = (0..rows[0].len()).map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0)).collect();
+    let lines: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let cells: Vec<String> = r.iter().zip(&widths).map(|(cell, &w)| format!("{cell:w$}")).collect();
+            format!("  {}", cells.join("  ").trim_end())
+        })
+        .collect();
+    format!("{name} ({detail})\n{}", lines.join("\n"))
+}
+
 impl State {
     fn readings(&mut self, now: f64) -> Probe {
         match &self.probe {
@@ -331,11 +371,17 @@ impl State {
         self.notices.push(Notice { session: t.session.clone(), ticket: t.id, text });
     }
 
+    fn close(&mut self, ticket: Ticket, now: f64, how: &str) {
+        self.closed.push(Closed { ticket, closed_at: now, how: how.into() });
+        let excess = self.closed.len().saturating_sub(HISTORY);
+        self.closed.drain(..excess);
+    }
+
     /// Apply the clock, then grant every queued ticket that the plan starts now. Returns the
     /// planned starts of queued tickets; one with none cannot fit even once every grant has
     /// ended, i.e. it waits for outside use to drop.
     fn tick(&mut self, now: f64) -> HashMap<u64, f64> {
-        let mut notes = Vec::new();
+        let (mut notes, mut expired) = (Vec::new(), Vec::new());
         self.tickets.retain_mut(|t| {
             let Some(end) = t.end else { return true };
             if now >= end + GRACE_S {
@@ -343,6 +389,7 @@ impl State {
                     "[resource-ledger] Ticket #{} ({}) was force-expired 15 min after its time ran out; its \
                      resources are now available to others. If that work is still running it may now collide.",
                     t.id, t.purpose)));
+                expired.push(t.clone());
                 return false;
             }
             if now >= end && !t.warned {
@@ -356,6 +403,9 @@ impl State {
         });
         for (t, text) in notes {
             self.notify(&t, text);
+        }
+        for t in expired {
+            self.close(t, now, "expired");
         }
         let excess = self.notices.len().saturating_sub(MAX_NOTICES);
         self.notices.drain(..excess);
@@ -399,20 +449,30 @@ impl State {
         placed.into_iter().map(|(id, (start, _))| (id, start)).collect()
     }
 
-    /// " on GPU 0 (name; selector)" for granted GPUs, as the last reading knows them.
+    /// A GPU's number and reading, as the last reading knows them.
+    fn find_gpu(&self, id: &str) -> Option<(usize, &Gpu)> {
+        self.probe.as_ref()?.gpus.iter().enumerate().find(|(_, g)| g.id == id)
+    }
+
+    /// " on GPU 0 (name; selector)" for granted GPUs.
     fn on_gpus(&self, ids: &[String]) -> String {
         if ids.is_empty() {
             return String::new();
         }
-        let gpus = self.probe.as_ref().map_or(&[][..], |p| &p.gpus[..]);
         let names: Vec<String> = ids
             .iter()
-            .map(|id| match gpus.iter().position(|g| &g.id == id) {
-                Some(i) => format!("GPU {i} ({})", label(&gpus[i])),
+            .map(|id| match self.find_gpu(id) {
+                Some((i, g)) => format!("GPU {i} ({})", label(g)),
                 None => format!("GPU {id}"),
             })
             .collect();
         format!(" on {}", names.join(" and "))
+    }
+
+    /// "0,1": the numbers of granted GPUs.
+    fn gpu_numbers(&self, ids: &[String]) -> String {
+        let nums: Vec<String> = ids.iter().map(|id| self.find_gpu(id).map_or_else(|| id.clone(), |(i, _)| i.to_string())).collect();
+        nums.join(",")
     }
 
     fn line(&self, t: &Ticket, starts: &HashMap<u64, f64>, now: f64) -> String {
@@ -510,9 +570,10 @@ impl State {
         let i = self.tickets.iter().position(|t| t.id == id).ok_or(format!("no open ticket #{id}"))?;
         let t = self.tickets.remove(i);
         self.notices.retain(|n| n.ticket != id);
+        let (what, purpose) = (if t.granted.is_some() { "released" } else { "cancelled" }, t.purpose.clone());
+        self.close(t, now, what);
         self.tick(now);
-        let what = if t.granted.is_some() { "released" } else { "cancelled" };
-        Ok(format!("#{id} {what} ({}).", t.purpose))
+        Ok(format!("#{id} {what} ({purpose})."))
     }
 
     pub fn extend(&mut self, now: f64, id: u64, minutes: f64) -> Result<String, String> {
@@ -563,6 +624,38 @@ impl State {
         out
     }
 
+    /// The ledger for people and agents: every open ticket, then the last closed ones,
+    /// newest first. A table, or JSON.
+    pub fn ledger(&mut self, now: f64, as_json: bool) -> Result<String, String> {
+        let starts = self.tick(now);
+        let closed: Vec<&Closed> = self.closed.iter().rev().collect();
+        if as_json {
+            let v = json!({"now": now, "open": self.tickets, "starts": starts, "closed": closed});
+            return serde_json::to_string_pretty(&v).map_err(err);
+        }
+        let mut open = vec![["#", "state", "session", "needs", "GPUs", "time", "purpose"].map(String::from).to_vec()];
+        for t in &self.tickets {
+            let time = match t.end {
+                None => starts.get(&t.id).map_or_else(|| "waits for outside use to drop".into(), |s| format!("starts in ~{}", dur(s - now))),
+                Some(end) if now < end => format!("{} left", dur(end - now)),
+                Some(end) => format!("out of time; expires in {}", dur(end + GRACE_S - now)),
+            };
+            let state = if t.granted.is_some() { "granted" } else { "queued" };
+            open.push(vec![t.id.to_string(), state.into(), short(&t.session), fmt_need(&t.need), self.gpu_numbers(&t.gpus), time, t.purpose.clone()]);
+        }
+        let mut done = vec![["#", "how", "session", "needs", "GPUs", "closed", "held for", "purpose"].map(String::from).to_vec()];
+        for c in closed {
+            let t = &c.ticket;
+            let held_for = t.granted.map_or_else(String::new, |g| dur(c.closed_at - g));
+            let ago = format!("{} ago", dur(now - c.closed_at));
+            done.push(vec![t.id.to_string(), c.how.clone(), short(&t.session), fmt_need(&t.need), self.gpu_numbers(&t.gpus), ago, held_for, t.purpose.clone()]);
+        }
+        Ok(format!(
+            "{}\n\n{}",
+            section("OPEN", &self.tickets.len().to_string(), &open),
+            section("CLOSED", &format!("newest first; the ledger keeps the last {HISTORY}"), &done)))
+    }
+
     /// This machine's resources, for the guide agents get when a session starts.
     pub fn pool(&mut self, now: f64) -> String {
         let p = self.readings(now);
@@ -595,7 +688,12 @@ impl State {
 
     /// The session is gone: nobody can be woken for its queued tickets any more.
     pub fn end_session(&mut self, now: f64, session: &str) {
-        self.tickets.retain(|t| t.session != session || t.granted.is_some());
+        let (gone, kept): (Vec<Ticket>, Vec<Ticket>) =
+            std::mem::take(&mut self.tickets).into_iter().partition(|t| t.session == session && t.granted.is_none());
+        self.tickets = kept;
+        for t in gone {
+            self.close(t, now, "cancelled");
+        }
         self.notices.retain(|n| n.session != session);
         self.tick(now);
     }
@@ -880,5 +978,53 @@ mod tests {
         st.end_session(T0, "s:a");
         assert!(!st.poll(T0, "s:a").open);
         assert!(st.poll(T0, "s:x").open);
+    }
+
+    #[test]
+    fn closed_tickets_are_kept_with_how_they_closed() {
+        let mut st = fresh();
+        req(&mut st, "s:a", [0.0, 0.0, 16.0], 30.0, T0); // #1 granted
+        req(&mut st, "s:b", [0.0, 0.0, 16.0], 30.0, T0); // #2 queued
+        req(&mut st, "s:c", [0.0, 0.0, 16.0], 30.0, T0); // #3 queued
+        st.release(T0, 2).unwrap();
+        st.end_session(T0, "s:c");
+        st.poll(T0 + 45.0 * MIN, "s:a"); // #1 is force-expired
+        req(&mut st, "s:a", [0.0, 0.0, 1.0], 30.0, T0 + 45.0 * MIN); // #4 granted
+        st.release(T0 + 50.0 * MIN, 4).unwrap();
+        let hows: Vec<(u64, &str)> = st.closed.iter().map(|c| (c.ticket.id, c.how.as_str())).collect();
+        assert_eq!(hows, [(2, "cancelled"), (3, "cancelled"), (1, "expired"), (4, "released")]);
+        for _ in 0..HISTORY {
+            req(&mut st, "s:a", [0.0, 0.0, 1.0], 30.0, T0 + 50.0 * MIN);
+            st.release(T0 + 50.0 * MIN, st.next_id).unwrap();
+        }
+        assert!(st.closed.len() == HISTORY && st.closed[0].ticket.id == 5);
+    }
+
+    #[test]
+    fn ledger_view_lists_open_then_closed() {
+        let mut st = fresh();
+        assert_eq!(st.ledger(T0, false).unwrap(), "OPEN: none\n\nCLOSED: none");
+        req(&mut st, "claude:5c1e7a42-8b3d-4f06", [8.0, 16.0, 4.0], 90.0, T0); // #1 granted on GPU 0
+        req(&mut st, "codex:0199a2b3-aaaa", [0.0, 0.0, 16.0], 30.0, T0); // #2 queued until #1 ends
+        req(&mut st, "s:x", [0.0, 0.0, 1.0], 10.0, T0); // #3 backfilled
+        st.release(T0 + 5.0 * MIN, 3).unwrap();
+        let v = st.ledger(T0 + 30.0 * MIN, false).unwrap();
+        let lines: Vec<&str> = v.lines().collect();
+        assert_eq!(lines[0], "OPEN (2)");
+        assert_eq!(lines[2], "  1  granted  claude:5c1e7a42  8 GB VRAM, 16 GB RAM, 4 CPUs  0     1 h left        job");
+        assert!(lines[3].starts_with("  2  queued   codex:0199a2b3   16 CPUs ") && lines[3].ends_with("starts in ~1 h  job"), "{v}");
+        assert_eq!(lines[5], "CLOSED (newest first; the ledger keeps the last 20)");
+        assert_eq!(lines[7], "  3  released  s:x      1 CPUs        25 min ago  5 min     job");
+
+        let j: serde_json::Value = serde_json::from_str(&st.ledger(T0 + 30.0 * MIN, true).unwrap()).unwrap();
+        assert_eq!(j["open"][0]["session"], "claude:5c1e7a42-8b3d-4f06");
+        assert_eq!(j["starts"]["2"], T0 + 90.0 * MIN);
+        assert!(j["closed"][0]["id"] == 3 && j["closed"][0]["how"] == "released" && j["closed"][0]["closed_at"] == T0 + 5.0 * MIN);
+    }
+
+    #[test]
+    fn a_ledger_from_before_history_still_loads() {
+        let st: State = serde_json::from_str(r#"{"next_id":3,"probe":null,"tickets":[],"notices":[]}"#).unwrap();
+        assert!(st.next_id == 3 && st.closed.is_empty());
     }
 }
